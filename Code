@@ -1,0 +1,167 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import cvxpy as cp
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LassoCV
+from typing import Dict, List, Optional, Union
+
+# --- Data Generation ---
+def generate_fake_data(n_assets=10, n_days=500):
+    np.random.seed(42)
+    returns = np.random.normal(0.001, 0.02, size=(n_days, n_assets))
+    prices = 100 * np.exp(np.cumsum(returns, axis=0))
+    dates = pd.date_range("2020-01-01", periods=n_days)
+    return pd.DataFrame(prices, columns=[f"Asset_{i}" for i in range(n_assets)], index=dates)
+
+# --- Feature Engineering ---
+def generate_features(price_df):
+    df = price_df.pct_change().dropna()
+    features = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        features[f"{col}_mean"] = df[col].rolling(window=10).mean()
+        features[f"{col}_std"] = df[col].rolling(window=10).std()
+        features[f"{col}_momentum"] = df[col] - df[col].shift(10)
+    return features.dropna()
+
+# --- Feature Selection ---
+def select_features(X, y):
+    model = RandomForestRegressor()
+    model.fit(X, y)
+    importances = model.feature_importances_
+    selected = X.columns[np.argsort(importances)[-10:]]
+    return X[selected]
+
+# --- Optimization Framework ---
+class LinearProgram:
+    def __init__(self):
+        self.variables = {}
+        self.constraints = []
+        self.objective = None
+        
+    def add_variable(self, name: str, shape: tuple = (1,), lb: float = None, ub: float = None) -> cp.Variable:
+        var = cp.Variable(shape, name=name)
+        if lb is not None:
+            self.constraints.append(var >= lb)
+        if ub is not None:
+            self.constraints.append(var <= ub)
+        self.variables[name] = var
+        return var
+        
+    def add_constraint(self, constraint) -> None:
+        self.constraints.append(constraint)
+        
+    def set_objective(self, objective, sense: str = 'minimize') -> None:
+        self.objective = cp.Minimize(objective) if sense == 'minimize' else cp.Maximize(objective)
+        
+    def solve(self, verbose: bool = False) -> dict:
+        prob = cp.Problem(self.objective, self.constraints)
+        prob.solve(verbose=verbose)
+        return {
+            'status': prob.status,
+            'value': prob.value,
+            'variables': {k: v.value for k, v in self.variables.items()}
+        }
+
+class ConvexProgram(LinearProgram):
+    def add_soc_constraint(self, expression, norm_expression) -> None:
+        self.constraints.append(cp.SOC(expression, norm_expression))
+
+# --- Optimization Objectives ---
+def sharpe_ratio_objective(returns):
+    program = ConvexProgram()
+    n = returns.shape[1]
+    weights = program.add_variable('weights', (n,), lb=0)
+    k = program.add_variable('k', (1,), lb=0)  # Add k variable
+
+    program.add_constraint(cp.sum(weights) == k) # change constraint
+    mu = returns.mean(axis=0)
+    Sigma = np.cov(returns, rowvar=False)
+
+    portfolio_return = mu @ weights
+    portfolio_risk = cp.quad_form(weights, Sigma)
+
+    program.set_objective(-portfolio_return + 0.5 * portfolio_risk) # change objective.
+
+    program.add_constraint(k == 1) # add constraint to fix k to 1.
+    result = program.solve()
+    return result['variables']['weights']
+
+def min_risk_objective(returns):
+    program = ConvexProgram()
+    n = returns.shape[1]
+    weights = program.add_variable('weights', (n,), lb=0)
+    program.add_constraint(cp.sum(weights) == 1)
+    Sigma = np.cov(returns, rowvar=False)
+    portfolio_risk = cp.quad_form(weights, Sigma)
+    program.set_objective(portfolio_risk)
+    result = program.solve()
+    return result['variables']['weights']
+
+# --- LSTM Model ---
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+def prepare_lstm_data(data, window=20):
+    X, y = [], []
+    for i in range(len(data) - window):
+        X.append(data[i:i+window])
+        y.append(data[i+window])
+    X = torch.tensor(np.array(X), dtype=torch.float32).reshape(len(X), window, 1)
+    y = torch.tensor(np.array(y), dtype=torch.float32).unsqueeze(1)
+    return X, y
+
+def train_lstm_model(X, y, input_size):
+    model = LSTMModel(input_size, hidden_size=32, num_layers=2)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    for epoch in range(30):
+        output = model(X)
+        loss = criterion(output, y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch}, Loss: {loss.item():.6f}")
+    return model
+
+# --- Learning to Rank (LTR) ---
+def learning_to_rank(features, returns):
+    model = RandomForestRegressor()
+    model.fit(features, returns)
+    ranked_returns = pd.Series(model.predict(features), index=returns.index).sort_values(ascending=False)
+    return ranked_returns
+
+# --- Main Workflow ---
+if __name__ == "__main__":
+    prices = generate_fake_data(n_assets=5, n_days=300)
+    returns = prices.pct_change().dropna()
+    features = generate_features(prices)
+    aligned_returns = returns.loc[features.index]
+    target = aligned_returns.mean(axis=1)
+    selected_features = select_features(features, target)
+
+    weights_sharpe = sharpe_ratio_objective(aligned_returns.values)
+    print("Optimized Weights (Sharpe Ratio):", weights_sharpe)
+    weights_min_risk = min_risk_objective(aligned_returns.values)
+    print("Optimized Weights (Min Risk):", weights_min_risk)
+
+    asset_returns = aligned_returns.iloc[:, 0].values
+    X_lstm, y_lstm = prepare_lstm_data(asset_returns, window=20)
+    model_lstm = train_lstm_model(X_lstm, y_lstm, input_size=1)
+    predicted = model_lstm(X_lstm).detach().numpy().flatten()
+    print("Sample Predictions:", predicted[:5])
+    
+    ranked_returns = learning_to_rank(selected_features, aligned_returns.mean(axis=1))
+    print ("Ranked Returns", ranked_returns.head())
